@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""
+yt2epub — YouTube 影片轉雙語 ePub
+===================================
+YouTube URL → 抓英文字幕 → Claude 翻譯繁中 → 雙語 ePub → Dropbox → Kobo
+
+使用方式:
+    python yt2epub.py "https://www.youtube.com/watch?v=VIDEO_ID"
+    python yt2epub.py "https://www.youtube.com/watch?v=VIDEO_ID" --title "DOAC EP1"
+    python yt2epub.py "https://www.youtube.com/watch?v=VIDEO_ID" --speakers "Steven Bartlett（主持人）,Mo Gawdat（來賓）"
+
+也支援本地音檔（自動 fallback 到 AssemblyAI 轉錄）:
+    python yt2epub.py episode.mp3
+
+環境變數:
+    ANTHROPIC_API_KEY      - 必須（翻譯用）
+    ASSEMBLYAI_API_KEY     - 選用（僅音檔 fallback 時需要）
+"""
+
+import argparse
+import anthropic
+import json
+import os
+import re
+import shutil
+import sys
+import uuid
+from datetime import datetime
+from ebooklib import epub
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent / ".env", override=True)
+except ImportError:
+    pass
+
+
+# ─────────────────────────────────────────────
+# 設定
+# ─────────────────────────────────────────────
+
+# Mac 上 Dropbox 桌面版同步資料夾（中文 locale 預設叫「應用程式」，英文叫 Apps）
+# 若你的 Dropbox 介面是英文，改 .env 的 DROPBOX_KOBO_LOCAL_PATH 或自行修改路徑
+DROPBOX_KOBO_PATH = Path(
+    os.environ.get(
+        "DROPBOX_KOBO_LOCAL_PATH",
+        str(Path.home() / "Dropbox" / "應用程式" / "Rakuten Kobo"),
+    )
+)
+OUTPUT_DIR = Path.home() / "yt2epub_output"
+
+# LLM provider：gemini | claude（環境變數 LLM_PROVIDER 可覆蓋）
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "gemini").lower()
+CLAUDE_MODEL = "claude-sonnet-4-6"
+GEMINI_MODEL = "gemini-3-flash-preview"  # 速度比 pro 快 6-8 倍、成本 1/10
+# thinking budget（Gemini 3）：1024≈low / 4096≈medium / 16384≈high / -1=auto
+GEMINI_THINKING_TRANSLATE = 1024  # 翻譯：簡單任務，低 thinking
+GEMINI_THINKING_CHAPTER = 4096    # 分章節：需要推理
+
+TRANSLATION_SYSTEM_PROMPT = """你是一位專業的英翻繁體中文翻譯。請遵守以下規則：
+
+1. 翻譯成自然流暢的繁體中文口語
+2. 重要的英文專業術語、產品名稱、技術概念，在中文後面用括號保留英文原文
+   例如：「模型上下文協議（Model Context Protocol）」
+3. 人名保留英文原文
+4. 保持原文的語氣和口吻（正式/輕鬆/幽默）
+5. 不要省略或簡化任何內容，完整翻譯每一句話
+6. 只回傳翻譯結果，不要加任何解釋或前言"""
+
+CHAPTER_SYSTEM_PROMPT = """你是一位 podcast / 訪談內容分析師。請分析以下逐字稿，做兩件事：
+1. 找出對話的所有發言者（主持人、來賓）
+2. 將對話按照討論主題分成章節
+
+請回傳 JSON 格式：
+{
+  "participants": [
+    {"name": "Patrick O'Shaughnessy", "role": "主持人"},
+    {"name": "Ben Horowitz", "role": "來賓"}
+  ],
+  "chapters": [
+    {
+      "title_en": "English chapter title",
+      "title_zh": "繁體中文章節標題",
+      "start_index": 0,
+      "end_index": 5
+    }
+  ]
+}
+
+participants 規則：
+- 從上下文找出每個人的全名（保留英文）
+- role 用「主持人」「來賓」「共同主持人」等簡單分類
+- 不確定就只列名字，role 留空字串
+- 只列實際有發言的人，不要把「被提到」的人列進來
+
+chapters 規則：
+- start_index 和 end_index 是對話段落的索引（從 0 開始，包含頭尾）
+- 每個章節大約包含 5-15 段對話
+- 章節標題要簡潔有力
+
+只回傳 JSON，不要加任何其他文字。"""
+
+
+# ─────────────────────────────────────────────
+# 工具函式
+# ─────────────────────────────────────────────
+
+def extract_video_id(url: str) -> str:
+    """從各種 YouTube URL 格式中提取 video ID。"""
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/|/shorts/)([a-zA-Z0-9_-]{11})',
+        r'(?:embed/)([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return url  # 假設直接傳入 ID
+
+
+def format_timestamp(seconds: float) -> str:
+    """把秒數轉成 MM:SS 格式。"""
+    minutes = int(seconds) // 60
+    secs = int(seconds) % 60
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def merge_short_segments(
+    snippets: list[dict],
+    min_duration: float = 15.0,
+    max_duration: float = 30.0,
+) -> list[dict]:
+    """
+    YouTube 字幕通常是短碎片（每句 2-5 秒）。
+    將它們合併成較長的段落，更適合閱讀。
+
+    斷段規則：
+      1) 已超過 min_duration 且字串以句末標點結束 → 斷
+      2) 已超過 max_duration（自動字幕常無標點，強制保底） → 斷
+    """
+    if not snippets:
+        return []
+
+    merged = []
+    current_text = ""
+    current_start = snippets[0]["start"]
+
+    for i, snip in enumerate(snippets):
+        current_text += " " + snip["text"]
+
+        elapsed = snip["start"] + snip.get("duration", 0) - current_start
+        is_last = (i == len(snippets) - 1)
+        ends_sentence = current_text.rstrip().endswith(('.', '?', '!', '。', '？', '！'))
+
+        should_break = is_last \
+            or (elapsed >= min_duration and ends_sentence) \
+            or (elapsed >= max_duration)
+
+        if should_break:
+            merged.append({
+                "timestamp": format_timestamp(current_start),
+                "en": current_text.strip(),
+            })
+            if not is_last:
+                current_start = snippets[i + 1]["start"]
+                current_text = ""
+
+    if current_text.strip() and (not merged or merged[-1]["en"] != current_text.strip()):
+        merged.append({
+            "timestamp": format_timestamp(current_start),
+            "en": current_text.strip(),
+        })
+
+    return merged
+
+
+# ─────────────────────────────────────────────
+# Step 1a: YouTube 字幕抓取
+# ─────────────────────────────────────────────
+
+def fetch_youtube_transcript(url: str) -> tuple[list[dict], dict]:
+    """從 YouTube 抓取英文字幕，回傳 (segments, video_info)。"""
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    video_id = extract_video_id(url)
+    print(f"🎬 正在抓取 YouTube 字幕（Video ID: {video_id}）...")
+
+    ytt_api = YouTubeTranscriptApi()
+
+    # 嘗試抓英文字幕（優先手動字幕，其次自動產生）
+    try:
+        transcript_list = ytt_api.list(video_id)
+
+        # 優先找手動英文字幕
+        transcript = None
+        try:
+            transcript = transcript_list.find_manually_created_transcript(['en', 'en-US', 'en-GB'])
+            print("   ✅ 找到手動建立的英文字幕")
+        except Exception:
+            try:
+                transcript = transcript_list.find_generated_transcript(['en', 'en-US', 'en-GB'])
+                print("   ✅ 找到自動產生的英文字幕")
+            except Exception:
+                print("   ❌ 找不到英文字幕")
+                return None, {}
+
+        fetched = transcript.fetch()
+        snippets = [
+            {"text": s.text, "start": s.start, "duration": s.duration}
+            for s in fetched.snippets
+        ]
+
+    except Exception as e:
+        print(f"   ❌ 無法取得字幕: {e}")
+        return None, {}
+
+    # 合併短碎片成可閱讀的段落
+    segments = merge_short_segments(snippets)
+    print(f"   📝 原始 {len(snippets)} 段字幕 → 合併為 {len(segments)} 段")
+
+    video_info = {
+        "video_id": video_id,
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+    }
+
+    return segments, video_info
+
+
+# ─────────────────────────────────────────────
+# Step 1b: AssemblyAI 轉錄（fallback）
+# ─────────────────────────────────────────────
+
+def transcribe_audio(audio_source: str) -> list[dict]:
+    """用 AssemblyAI 轉錄音檔（fallback 方案）。"""
+    import assemblyai as aai
+
+    print("🎙  YouTube 字幕不可用，改用 AssemblyAI 轉錄...")
+
+    api_key = os.environ.get("ASSEMBLYAI_API_KEY")
+    if not api_key:
+        print("❌ 請設定環境變數 ASSEMBLYAI_API_KEY")
+        print("   export ASSEMBLYAI_API_KEY='your-key-here'")
+        sys.exit(1)
+
+    aai.settings.api_key = api_key
+
+    config = aai.TranscriptionConfig(
+        speaker_labels=True,
+        language_code="en",
+    )
+
+    transcriber = aai.Transcriber()
+    transcript = transcriber.transcribe(audio_source, config=config)
+
+    if transcript.status == aai.TranscriptStatus.error:
+        print(f"❌ 轉錄失敗: {transcript.error}")
+        sys.exit(1)
+
+    segments = []
+    for utterance in transcript.utterances:
+        total_seconds = utterance.start // 1000
+        timestamp = format_timestamp(total_seconds)
+
+        segments.append({
+            "speaker": utterance.speaker,
+            "timestamp": timestamp,
+            "en": utterance.text,
+        })
+
+    speaker_count = len(set(s.get("speaker", "") for s in segments))
+    print(f"✅ 轉錄完成，共 {len(segments)} 段，{speaker_count} 位講者")
+    return segments
+
+
+# ─────────────────────────────────────────────
+# LLM 抽象（Gemini / Claude）
+# ─────────────────────────────────────────────
+
+_gemini_client = None
+_anthropic_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            print("❌ 請設定環境變數 GEMINI_API_KEY")
+            sys.exit(1)
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
+
+
+def _get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            print("❌ 請設定環境變數 ANTHROPIC_API_KEY")
+            sys.exit(1)
+        _anthropic_client = anthropic.Anthropic(api_key=api_key, timeout=180.0, max_retries=2)
+    return _anthropic_client
+
+
+def llm_call(system_prompt: str, user_prompt: str, max_tokens: int, *,
+             thinking_budget: int = 1024, cache_system: bool = True) -> str:
+    """統一 LLM 入口，依 LLM_PROVIDER 切換。"""
+    if LLM_PROVIDER == "gemini":
+        from google.genai import types
+        client = _get_gemini_client()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=max_tokens,
+                thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+            ),
+        )
+        return response.text or ""
+    # Claude
+    client = _get_anthropic_client()
+    system_block = {"type": "text", "text": system_prompt}
+    if cache_system:
+        system_block["cache_control"] = {"type": "ephemeral"}
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=max_tokens,
+        system=[system_block],
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    return response.content[0].text
+
+
+# ─────────────────────────────────────────────
+# Step 2: 翻譯
+# ─────────────────────────────────────────────
+
+def translate_segments(segments: list[dict], batch_size: int = 10) -> list[dict]:
+    """批次翻譯成繁體中文（依 LLM_PROVIDER 用 Gemini 或 Claude）。"""
+    print(f"🌐 正在翻譯成繁體中文（{LLM_PROVIDER}）...")
+
+    translated = []
+    total_batches = (len(segments) + batch_size - 1) // batch_size
+
+    for i in range(0, len(segments), batch_size):
+        batch = segments[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        print(f"   翻譯中... ({batch_num}/{total_batches})", flush=True)
+
+        lines = [f"[{j}] {seg['en']}" for j, seg in enumerate(batch)]
+        prompt = (
+            "請翻譯以下編號的英文段落成繁體中文。\n"
+            "每段翻譯用同樣的編號格式回傳，例如：\n"
+            "[0] 翻譯內容\n"
+            "[1] 翻譯內容\n\n"
+            + "\n".join(lines)
+        )
+
+        # max_tokens 給足空間（thinking + 輸出）
+        response_text = llm_call(
+            TRANSLATION_SYSTEM_PROMPT, prompt,
+            max_tokens=8192,
+            thinking_budget=GEMINI_THINKING_TRANSLATE,
+        )
+
+        translations = {}
+        for match in re.finditer(r'\[(\d+)\]\s*(.*?)(?=\n\[|\Z)', response_text, re.DOTALL):
+            idx = int(match.group(1))
+            translations[idx] = match.group(2).strip()
+
+        for j, seg in enumerate(batch):
+            seg_copy = seg.copy()
+            seg_copy["zh"] = translations.get(j, f"（翻譯失敗：{seg['en'][:50]}...）")
+            translated.append(seg_copy)
+
+    print(f"✅ 翻譯完成，共 {len(translated)} 段")
+    return translated
+
+
+# ─────────────────────────────────────────────
+# Step 3: 自動分章節（Claude API）
+# ─────────────────────────────────────────────
+
+def detect_chapters(segments: list[dict]) -> list[dict]:
+    """自動偵測主題，將逐字稿分章節（依 LLM_PROVIDER 用 Gemini 或 Claude）。"""
+    print(f"📑 正在自動分章節（{LLM_PROVIDER}）...")
+
+    condensed = []
+    for i, seg in enumerate(segments):
+        preview = seg["en"][:120] + ("..." if len(seg["en"]) > 120 else "")
+        speaker = seg.get("speaker", "")
+        prefix = f"Speaker {speaker}: " if speaker else ""
+        condensed.append(f"[{i}] [{seg['timestamp']}] {prefix}{preview}")
+
+    prompt = (
+        f"以下是一段影片/podcast 逐字稿，共 {len(segments)} 段。\n"
+        "請找出對談人並依主題分章節。\n\n"
+        + "\n".join(condensed)
+    )
+
+    response_text = llm_call(
+        CHAPTER_SYSTEM_PROMPT, prompt,
+        max_tokens=8192,
+        thinking_budget=GEMINI_THINKING_CHAPTER,
+    )
+    response_text = re.sub(r'^```json\s*', '', response_text.strip())
+    response_text = re.sub(r'\s*```$', '', response_text.strip())
+
+    try:
+        data = json.loads(response_text)
+        chapters = data["chapters"]
+        participants = data.get("participants", [])
+        print(f"✅ 自動分成 {len(chapters)} 個章節，{len(participants)} 位對談人")
+        return {"chapters": chapters, "participants": participants}
+    except (json.JSONDecodeError, KeyError) as e:
+        print(f"⚠️  章節偵測失敗 ({e})，將所有內容放入單一章節")
+        return {
+            "chapters": [{
+                "title_en": "Full Episode",
+                "title_zh": "完整內容",
+                "start_index": 0,
+                "end_index": len(segments) - 1,
+            }],
+            "participants": [],
+        }
+
+
+# ─────────────────────────────────────────────
+# Step 4: 生成 ePub
+# ─────────────────────────────────────────────
+
+EPUB_CSS = """
+body {
+    font-family: "Noto Serif CJK TC", "Source Han Serif TC", "Georgia", serif;
+    font-size: 0.75em;
+    line-height: 1.2;
+    color: #1a1a1a;
+    padding: 1.3em;
+}
+
+a {
+    text-decoration: none;
+    color: inherit;
+}
+
+nav ol, nav ul {
+    list-style: none;
+    padding-left: 0;
+    line-height: 1.2;
+}
+
+h1 {
+    font-size: 1.15em;
+    font-weight: bold;
+    color: #222;
+    border-bottom: 2px solid #c0392b;
+    padding-bottom: 0.3em;
+    margin-top: 1.5em;
+    margin-bottom: 0.3em;
+}
+
+h1 .chapter-zh {
+    display: block;
+    font-size: smaller;
+    color: #555;
+    margin-top: 0.2em;
+    font-weight: normal;
+}
+
+.speaker {
+    font-weight: bold;
+    color: #c0392b;
+    margin-top: 1.5em;
+    margin-bottom: 0.2em;
+    border-left: 3px solid #c0392b;
+    padding-left: 0.6em;
+}
+
+.speaker-b { color: #2c3e50; border-left-color: #2c3e50; }
+.speaker-c { color: #27ae60; border-left-color: #27ae60; }
+.speaker-d { color: #8e44ad; border-left-color: #8e44ad; }
+
+.timestamp {
+    font-size: smaller;
+    color: #999;
+    font-family: monospace;
+    margin-left: 0.5em;
+    font-weight: normal;
+}
+
+.zh {
+    color: #1a1a1a;
+    line-height: 1.4;
+    margin: 0.3em 0 1em 0;
+}
+
+.segment { margin-bottom: 1em; }
+
+.cover-title {
+    font-size: 1.4em;
+    font-weight: bold;
+    text-align: center;
+    margin-top: 2em;
+    line-height: 1.3;
+    color: #c0392b;
+}
+
+.cover-subtitle {
+    font-size: 1em;
+    text-align: center;
+    color: #555;
+    margin-top: 0.8em;
+}
+
+.cover-meta {
+    text-align: center;
+    margin-top: 2em;
+    color: #777;
+    line-height: 1.4;
+}
+
+.episode-info {
+    border: 1px solid #ddd;
+    padding: 1em;
+    margin: 1.5em 0;
+    background-color: #fafafa;
+}
+
+.episode-info h2 {
+    font-size: 1em;
+    font-weight: bold;
+    margin-top: 0;
+    margin-bottom: 0.5em;
+    color: #c0392b;
+}
+
+.source-link {
+    text-align: center;
+    margin-top: 1em;
+    font-size: smaller;
+    color: #999;
+}
+"""
+
+SPEAKER_CLASSES = [
+    "speaker", "speaker speaker-b",
+    "speaker speaker-c", "speaker speaker-d",
+]
+SPEAKER_ICONS = ["🔴", "🔵", "🟢", "🟣"]
+
+
+def generate_text_cover(title: str, subtitle: str = "") -> bytes:
+    """畫乾淨的純文字書封：白底、深灰標題置中、細分隔線、副標題。"""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    # 4:3 直立比例，貼合 Kobo 螢幕原生比例，避免休眠時 letterbox 邊框
+    W, H = 1500, 2000
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+
+    font_paths = [
+        # macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+        # Linux（Ubuntu/Debian 預設裝在這幾個路徑）
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    ]
+    title_font = None
+    sub_font = None
+    for fp in font_paths:
+        try:
+            title_font = ImageFont.truetype(fp, 66)
+            sub_font = ImageFont.truetype(fp, 38)
+            break
+        except Exception:
+            continue
+    if not title_font:
+        title_font = ImageFont.load_default()
+        sub_font = ImageFont.load_default()
+
+    # 標題自動換行（依字元寬度）
+    def wrap(text, font, max_w):
+        words = text.split()
+        lines, cur = [], ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if draw.textlength(test, font=font) <= max_w:
+                cur = test
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        return lines
+
+    title_lines = wrap(title, title_font, W - 140)
+    line_h = 90
+    total_h = len(title_lines) * line_h
+
+    # 整體（標題 + 副標題）置中，無分隔線
+    sub_gap = 60
+    sub_h = 40 if subtitle else 0
+    block_h = total_h + (sub_gap + sub_h if subtitle else 0)
+    start_y = (H - block_h) // 2
+
+    for i, line in enumerate(title_lines):
+        tw = draw.textlength(line, font=title_font)
+        draw.text(((W - tw) / 2, start_y + i * line_h), line, fill="#1a1a1a", font=title_font)
+
+    if subtitle:
+        sub_y = start_y + total_h + sub_gap
+        sw = draw.textlength(subtitle, font=sub_font)
+        draw.text(((W - sw) / 2, sub_y), subtitle, fill="#444444", font=sub_font)
+
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+def build_epub(segments, chapters, meta, output_path):
+    """組裝雙語 ePub。"""
+    print("📖 正在生成 ePub...")
+
+    book = epub.EpubBook()
+    book.set_identifier(str(uuid.uuid4()))
+    book.set_title(meta["title"])
+    book.set_language("zh-TW")
+    book.add_author(meta.get("podcast_name") or "YouTube")
+    book.add_metadata("DC", "date", meta.get("date", datetime.now().strftime("%Y-%m-%d")))
+
+    # 用 Pillow 畫純文字封面圖（給 Kobo 書庫縮圖用），create_page=False 避免 JPEG 變成內頁
+    cover_img = generate_text_cover(meta["title"], meta.get("podcast_name", ""))
+    if cover_img:
+        book.set_cover("cover.jpg", cover_img, create_page=False)
+        print(f"   ✅ 書封圖已生成（{len(cover_img) // 1024} KB）")
+
+    css = epub.EpubItem(
+        uid="style", file_name="style/main.css",
+        media_type="text/css", content=EPUB_CSS.encode("utf-8"),
+    )
+    book.add_item(css)
+
+    # 講者對照
+    unique_speakers = sorted(set(s.get("speaker", "") for s in segments if s.get("speaker")))
+    speaker_names = meta.get("speaker_names", {})
+    speaker_display = {spk: speaker_names.get(spk, f"Speaker {spk}") for spk in unique_speakers}
+    has_speakers = len(unique_speakers) > 0
+
+    # 封面頁
+    speakers_html = ""
+    if has_speakers:
+        speakers_html = "\n".join(
+            f"<p>{SPEAKER_ICONS[i % len(SPEAKER_ICONS)]} {speaker_display[spk]}</p>"
+            for i, spk in enumerate(unique_speakers)
+        )
+
+    desc_block = ""
+    if meta.get("description"):
+        desc_block = f'<div class="episode-info"><h2>簡介</h2><p>{meta["description"]}</p></div>'
+
+    # 對談人清單（從 chapter 偵測時順便抓到的）
+    participants_block = ""
+    participants = meta.get("participants", [])
+    if participants:
+        items = []
+        for i, p in enumerate(participants):
+            icon = SPEAKER_ICONS[i % len(SPEAKER_ICONS)]
+            name = p.get("name", "")
+            role = p.get("role", "")
+            label = f"{icon} <strong>{name}</strong>"
+            if role:
+                label += f" <span style=\"color:#777;font-size:0.9em\">— {role}</span>"
+            items.append(f"<p>{label}</p>")
+        participants_block = (
+            f'<div class="episode-info"><h2>對談人</h2>{"".join(items)}</div>'
+        )
+
+    source_block = ""
+    if meta.get("url"):
+        source_block = f'<div class="source-link">原始影片: {meta["url"]}</div>'
+
+    # 第 1 頁：直接顯示 Pillow 生成的封面圖（讓休眠 / 書庫 / 第一頁看到同一張）
+    cover_html = """<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-TW">
+<head><title>封面</title></head>
+<body style="margin:0;padding:0;text-align:center;">
+  <img src="cover.jpg" alt="cover" style="max-width:100%;max-height:100%;display:block;margin:0 auto;"/>
+</body>
+</html>"""
+
+    cover_page = epub.EpubHtml(title="封面", file_name="cover.xhtml", lang="zh-TW")
+    cover_page.content = cover_html.encode("utf-8")
+    book.add_item(cover_page)
+
+    # 第 2 頁：簡介（對談人 / 描述 / 原始連結）
+    info_inner = participants_block + desc_block + source_block
+    info_html = f"""<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-TW">
+<head><title>簡介</title>
+<link rel="stylesheet" type="text/css" href="style/main.css"/></head>
+<body>
+    <h1>簡介<span class="chapter-zh">{meta.get('podcast_name', '')} · {meta.get('date', '')}</span></h1>
+    {info_inner}
+</body>
+</html>""" if info_inner else ""
+
+    front_pages = [cover_page]
+    if info_html:
+        info_page = epub.EpubHtml(title="簡介", file_name="info.xhtml", lang="zh-TW")
+        info_page.content = info_html.encode("utf-8")
+        info_page.add_item(css)
+        book.add_item(info_page)
+        front_pages.append(info_page)
+
+    chapter_pages = []
+    toc = []
+
+    for ch_idx, ch in enumerate(chapters, 1):
+        start = ch["start_index"]
+        end = ch["end_index"]
+        ch_segments = segments[start:end + 1]
+
+        segments_html = ""
+        for seg in ch_segments:
+            speaker = seg.get("speaker", "")
+
+            if speaker:
+                if speaker in unique_speakers:
+                    spk_idx = unique_speakers.index(speaker)
+                else:
+                    spk_idx = 0
+                spk_class = SPEAKER_CLASSES[spk_idx % len(SPEAKER_CLASSES)]
+                spk_name = speaker_display.get(speaker, speaker)
+                speaker_div = f'<div class="{spk_class}">🎙 {spk_name} <span class="timestamp">[{seg["timestamp"]}]</span></div>'
+            else:
+                speaker_div = f'<div class="speaker"><span class="timestamp">[{seg["timestamp"]}]</span></div>'
+
+            segments_html += f"""
+    <div class="segment">
+        {speaker_div}
+        <div class="zh">{seg.get('zh', '')}</div>
+    </div>"""
+
+        chapter_html = f"""<?xml version='1.0' encoding='utf-8'?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="zh-TW">
+<head><title>Ch.{ch_idx} {ch['title_zh']}</title>
+<link rel="stylesheet" type="text/css" href="style/main.css"/></head>
+<body>
+    <h1>Ch.{ch_idx} — {ch['title_en']}
+        <span class="chapter-zh">{ch['title_zh']}</span>
+    </h1>
+    {segments_html}
+</body>
+</html>"""
+
+        epub_ch = epub.EpubHtml(
+            title=f"Ch.{ch_idx} {ch['title_zh']}",
+            file_name=f"ch_{ch_idx:02d}.xhtml", lang="zh-TW",
+        )
+        epub_ch.content = chapter_html.encode("utf-8")
+        epub_ch.add_item(css)
+        book.add_item(epub_ch)
+        chapter_pages.append(epub_ch)
+        toc.append(epub_ch)
+
+    book.toc = toc
+    book.add_item(epub.EpubNcx())
+    nav_item = epub.EpubNav()
+    nav_item.add_item(css)
+    book.add_item(nav_item)
+    # 順序：封面頁 → (簡介頁) → 各章；nav 標記 linear="no" 讓 Kobo 翻頁時跳過
+    book.spine = front_pages + [(nav_item, "no")] + chapter_pages
+
+    epub.write_epub(output_path, book, {})
+
+    # 後處理：把 nav.xhtml 的 <ol> 改成 <ul>，避免 Kobo 內建 TOC 顯示 1.2.3.
+    _strip_nav_ordered_list(output_path)
+
+    print(f"✅ ePub 已生成: {output_path}")
+
+
+def _strip_nav_ordered_list(epub_path: str):
+    """把 EPUB 內 nav.xhtml 的 <ol> 改成 <ul>，移除目錄編號。"""
+    import zipfile
+    import shutil
+    tmp_path = epub_path + ".tmp"
+    with zipfile.ZipFile(epub_path, "r") as zin:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.endswith("nav.xhtml"):
+                    text = data.decode("utf-8")
+                    text = text.replace("<ol>", "<ul>").replace("</ol>", "</ul>")
+                    data = text.encode("utf-8")
+                zout.writestr(item, data)
+    shutil.move(tmp_path, epub_path)
+
+
+# ─────────────────────────────────────────────
+# Step 5: Dropbox → Kobo
+# ─────────────────────────────────────────────
+
+def copy_to_kobo(epub_path: str) -> bool:
+    """同步 epub 到 Dropbox。
+
+    自動偵測：
+    - 本地有 Dropbox 桌面版資料夾（Mac）→ 用 shutil.copy2
+    - 沒有資料夾但 .env 設了 Dropbox API 憑證（Server）→ 用 API 上傳
+    """
+    # 路徑 A: 本地 Dropbox 資料夾（Mac 桌面版）
+    if DROPBOX_KOBO_PATH.exists():
+        dest = DROPBOX_KOBO_PATH / Path(epub_path).name
+        shutil.copy2(epub_path, dest)
+        print(f"📲 已複製到本地 Dropbox（Kobo）: {dest}")
+        return True
+
+    # 路徑 B: Dropbox API（Server 上沒有桌面版）
+    try:
+        from dropbox_uploader import upload_to_kobo, is_configured
+    except ImportError:
+        print("⚠️  找不到本地 Dropbox 資料夾，且 dropbox_uploader 模組無法載入")
+        return False
+
+    if is_configured():
+        try:
+            upload_to_kobo(epub_path)
+            return True
+        except Exception as e:
+            print(f"❌ Dropbox API 上傳失敗: {e}")
+            return False
+
+    print(f"⚠️  找不到 {DROPBOX_KOBO_PATH}，且 .env 沒有 Dropbox API 憑證")
+    print("   Mac：請確認 Dropbox 桌面版已安裝")
+    print("   Server：請設定 DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN")
+    return False
+
+
+# ─────────────────────────────────────────────
+# 儲存中繼資料
+# ─────────────────────────────────────────────
+
+def save_data(segments, chapters, meta, output_dir):
+    """儲存 JSON 中繼資料，方便重新生成。"""
+    data = {
+        "meta": meta, "chapters": chapters,
+        "segments": segments,
+        "generated_at": datetime.now().isoformat(),
+    }
+    path = output_dir / f"{meta['safe_filename']}_data.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"💾 資料已儲存: {path}")
+
+
+# ─────────────────────────────────────────────
+# 主程式
+# ─────────────────────────────────────────────
+
+def is_youtube_url(s: str) -> bool:
+    return any(x in s for x in ["youtube.com", "youtu.be"])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="yt2epub — YouTube 影片 / Podcast 轉雙語 ePub",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+範例:
+  python yt2epub.py "https://www.youtube.com/watch?v=xxxxx"
+  python yt2epub.py "https://youtu.be/xxxxx" --title "DOAC - Mo Gawdat"
+  python yt2epub.py "https://youtu.be/xxxxx" --speakers "Steven Bartlett（主持人）,Mo Gawdat（來賓）"
+  python yt2epub.py episode.mp3 --title "My Podcast EP1"
+  python yt2epub.py --from-json ~/yt2epub_output/xxx_data.json
+        """,
+    )
+    parser.add_argument("source", nargs="?", help="YouTube URL 或音檔路徑")
+    parser.add_argument("--title", "-t", help="ePub 標題")
+    parser.add_argument("--podcast-name", "-p", help="節目名稱", default="")
+    parser.add_argument("--speakers", "-s",
+                        help="講者名稱（逗號分隔，依 Speaker A,B,C 順序）")
+    parser.add_argument("--description", "-d", help="簡介", default="")
+    parser.add_argument("--no-kobo", action="store_true", help="不複製到 Kobo")
+    parser.add_argument("--from-json", help="從 JSON 重新生成（跳過轉錄和翻譯）")
+    parser.add_argument("--batch-size", type=int, default=10, help="翻譯批次大小")
+
+    args = parser.parse_args()
+
+    if not args.source and not args.from_json:
+        parser.error("請提供 YouTube URL / 音檔路徑，或用 --from-json 重新生成")
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    if args.from_json:
+        print(f"📂 從 JSON 載入: {args.from_json}")
+        with open(args.from_json, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        segments = data["segments"]
+        chapters = data["chapters"]
+        meta = data["meta"]
+        if args.title:
+            meta["title"] = args.title
+        if args.podcast_name:
+            meta["podcast_name"] = args.podcast_name
+        # 用最新規則重算檔名
+        cleaned = re.sub(r'[/\\:*?"<>|]', '', meta.get("title", ""))
+        meta["safe_filename"] = re.sub(r'\s+', ' ', cleaned).strip() or meta.get("safe_filename", "video")
+        # 寫回 JSON 保存補齊的欄位
+        if args.podcast_name or args.title:
+            data["meta"] = meta
+            with open(args.from_json, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"💾 已更新 JSON：{args.from_json}")
+    else:
+        # 建立 meta
+        source_name = extract_video_id(args.source) if is_youtube_url(args.source) else Path(args.source).stem
+        # 只把檔案系統不允許的字元拿掉，保留空格與中文，連續空格合併成一個
+        cleaned = re.sub(r'[/\\:*?"<>|]', '', args.title or source_name)
+        safe_filename = re.sub(r'\s+', ' ', cleaned).strip()
+
+        meta = {
+            "title": args.title or source_name,
+            "podcast_name": args.podcast_name,
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "description": args.description,
+            "safe_filename": safe_filename,
+            "speaker_names": {},
+            "url": args.source if is_youtube_url(args.source) else "",
+        }
+
+        if args.speakers:
+            for i, name in enumerate(args.speakers.split(",")):
+                letters = ["A", "B", "C", "D", "E", "F"]
+                if i < len(letters):
+                    meta["speaker_names"][letters[i]] = name.strip()
+
+        print("=" * 50)
+        print(f"🎧 yt2epub — {meta['title']}")
+        print("=" * 50)
+
+        # Step 1: 取得逐字稿
+        if is_youtube_url(args.source):
+            segments, video_info = fetch_youtube_transcript(args.source)
+            meta.update(video_info)
+
+            if segments is None:
+                print("\n⚠️  YouTube 字幕不可用")
+                print("   你可以下載音檔後用以下指令重試：")
+                print(f"   python yt2epub.py downloaded_audio.mp3 --title \"{meta['title']}\"")
+                sys.exit(1)
+        else:
+            segments = transcribe_audio(args.source)
+
+        # Step 2: 翻譯
+        segments = translate_segments(segments, batch_size=args.batch_size)
+
+        # Step 3: 分章節 + 找對談人
+        result = detect_chapters(segments)
+        chapters = result["chapters"]
+        meta["participants"] = result.get("participants", [])
+
+        # 儲存
+        save_data(segments, chapters, meta, OUTPUT_DIR)
+
+    # Step 4: 生成 ePub
+    epub_path = str(OUTPUT_DIR / f"{meta.get('safe_filename', 'video')}.epub")
+    build_epub(segments, chapters, meta, epub_path)
+
+    # Step 5: Kobo
+    if not args.no_kobo:
+        copy_to_kobo(epub_path)
+
+    print()
+    print("=" * 50)
+    print("🎉 完成！")
+    print(f"   ePub: {epub_path}")
+    if not args.no_kobo:
+        print("   Kobo: Dropbox 同步後即可下載閱讀")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()

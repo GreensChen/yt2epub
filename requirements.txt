@@ -1,0 +1,7 @@
+youtube-transcript-api
+anthropic
+ebooklib
+assemblyai
+python-dotenv
+python-telegram-bot
+dropbox

@@ -1,0 +1,33 @@
+# 敏感資料 / API keys
+.env
+
+# 個人訂閱 / 觀看記錄
+channels.json
+seen.json
+summaries/
+
+# 執行紀錄
+*.log
+launchd*.log
+bot_service*.log
+daily_brief*.log
+yt2epub_run_*.log
+yt2epub_output/
+brief_*.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Dropbox / Kobo（Mac 本地同步資料夾）
+*.epub

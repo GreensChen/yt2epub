@@ -1,0 +1,14 @@
+[
+  {
+    "_comment": "範例：訂閱 Acquired podcast 頻道。複製這個檔案成 channels.json 後改成你自己的訂閱。",
+    "type": "channel",
+    "id": "UCyFqFYfTW2VoIQKylJ04Rtw",
+    "name": "Acquired"
+  },
+  {
+    "_comment": "範例：訂閱某個 YouTube playlist。",
+    "type": "playlist",
+    "id": "PLMUnYeeTvzNsu5Z2B17k_VlzOPnB45A1n",
+    "name": "Thoughts on the Market"
+  }
+]
