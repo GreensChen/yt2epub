@@ -127,6 +127,36 @@ def format_timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+# YouTube 自動字幕常見的非語音標記，要在翻譯前過濾掉
+_NOISE_MARKER_PATTERN = re.compile(
+    r"\[\s*("
+    r"music|musique|musik|音[樂楽]|"
+    r"laughter|laughs?|笑聲|"
+    r"applause|clapping|掌聲|"
+    r"cheers?|cheering|歡呼|"
+    r"inaudible|不清楚|聽不清楚|"
+    r"silence|沉默|"
+    r"sound effect|聲音效果|"
+    r"background\s*music|背景音樂|"
+    r"crosstalk|交談聲"
+    r")\s*\]",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_caption_noise(text: str) -> str:
+    """清掉 YouTube 自動字幕的非語音標記與發言者切換符號。"""
+    if not text:
+        return text
+    # 拿掉 [Music] / [Laughter] 等標記
+    text = _NOISE_MARKER_PATTERN.sub(" ", text)
+    # 拿掉 >> 發言者切換符號（YouTube 自動字幕用來標示換人說話）
+    text = re.sub(r">>+\s*", " ", text)
+    # 收斂多重空白
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def merge_short_segments(
     snippets: list[dict],
     min_duration: float = 15.0,
@@ -148,29 +178,35 @@ def merge_short_segments(
     current_start = snippets[0]["start"]
 
     for i, snip in enumerate(snippets):
-        current_text += " " + snip["text"]
+        # 清掉 [Music]/[Laughter]/>> 等噪音再合併
+        cleaned = clean_caption_noise(snip["text"])
+        if cleaned:
+            current_text += " " + cleaned
 
         elapsed = snip["start"] + snip.get("duration", 0) - current_start
         is_last = (i == len(snippets) - 1)
-        ends_sentence = current_text.rstrip().endswith(('.', '?', '!', '。', '？', '！'))
+        ends_sentence = current_text.rstrip().endswith(('.', '?', '!', '。', '？', '!'))
 
         should_break = is_last \
             or (elapsed >= min_duration and ends_sentence) \
             or (elapsed >= max_duration)
 
         if should_break:
-            merged.append({
-                "timestamp": format_timestamp(current_start),
-                "en": current_text.strip(),
-            })
+            text_clean = current_text.strip()
+            if text_clean:  # 跳過全空段（如果整段都是 [Music]）
+                merged.append({
+                    "timestamp": format_timestamp(current_start),
+                    "en": text_clean,
+                })
             if not is_last:
                 current_start = snippets[i + 1]["start"]
                 current_text = ""
 
-    if current_text.strip() and (not merged or merged[-1]["en"] != current_text.strip()):
+    last_clean = current_text.strip()
+    if last_clean and (not merged or merged[-1]["en"] != last_clean):
         merged.append({
             "timestamp": format_timestamp(current_start),
-            "en": current_text.strip(),
+            "en": last_clean,
         })
 
     return merged

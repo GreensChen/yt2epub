@@ -50,6 +50,13 @@ CLAUDE_MODEL = "claude-haiku-4-5"
 MAX_VIDEOS_PER_RUN = 20  # 安全上限，避免一次燒太多 token
 MAX_TRANSCRIPT_CHARS = 60000  # 截斷超長字幕（約 ~15k tokens）
 
+# 推送過濾：哪些 relevance 等級值得進 Telegram 訊息流
+# - high     ：直接相關，建議轉 epub
+# - medium   ：部分相關
+# - low      ：邊緣相關（預設過濾掉）
+# - off-topic：完全無關（永遠過濾）
+PUSH_RELEVANCE_THRESHOLD = {"high", "medium"}
+
 SUMMARY_SYSTEM_PROMPT = """你是一位專業的 podcast / 訪談摘要員，服務的對象是一位關注**科技、財經、投資、創業**的讀者。
 
 你的任務是把英文長對談轉成繁體中文摘要，幫他決定**值不值得把整集轉成完整逐字稿 epub**。
@@ -156,6 +163,47 @@ def save_seen(seen: dict):
 # 摘要（Claude）
 # ─────────────────────────────────────────────
 
+TITLE_RELEVANCE_PROMPT = """你是一位內容過濾助手，幫一位關注**科技、財經、投資、創業**的讀者判斷影片是否值得他關注。
+
+只看到標題與頻道名（沒有字幕內容），請給判斷：
+
+回傳 JSON：
+{
+  "relevance": "high | medium | low | off-topic",
+  "relevance_reason": "30 字內理由（中文）",
+  "tags": ["3-5 個 tag"]
+}
+
+評分標準：
+- high：明確是科技/財經/投資/創業深度訪談（例：Acquired、Invest Like the Best、Lex Fridman 訪談類）
+- medium：可能相關但不確定（例：頻道剛好碰到主題，但格式不明）
+- low：邊緣相關
+- off-topic：純娛樂、運動、生活 vlog 等
+
+只回傳 JSON，不要前言。"""
+
+
+def check_title_relevance(video: dict, channel_name: str) -> dict:
+    """無字幕時用：只用標題 + 頻道名做輕量相關性判斷。"""
+    prompt = f"頻道：{channel_name}\n影片標題：{video['title']}"
+    try:
+        raw = llm_call(TITLE_RELEVANCE_PROMPT, prompt, max_tokens=400, thinking_budget=512)
+        text = raw.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1:
+            text = text[start:end + 1]
+        return json.loads(text)
+    except Exception as e:
+        return {
+            "relevance": "unknown",
+            "relevance_reason": f"標題判斷失敗：{e}",
+            "tags": [],
+        }
+
+
 def summarize_video(video: dict, channel_name: str, _client=None) -> dict:
     """抓字幕 + 摘要（依 LLM_PROVIDER 走 Gemini 或 Claude）。
 
@@ -165,11 +213,16 @@ def summarize_video(video: dict, channel_name: str, _client=None) -> dict:
 
     segments, _ = fetch_youtube_transcript(video["url"])
     if not segments:
+        # 無字幕 → 用標題做輕量判斷，讓使用者自己決定要不要看
+        print(f"     ⚠️ 無字幕，改用標題做相關性判斷")
+        title_check = check_title_relevance(video, channel_name)
         return {
             "no_transcript": True,
-            "relevance": "unknown",
-            "tags": [],
+            "relevance": title_check.get("relevance", "unknown"),
+            "relevance_reason": title_check.get("relevance_reason", ""),
+            "tags": title_check.get("tags", []),
             "summary": "",
+            "narrative_blocks": [],
         }
 
     formatted = "\n".join(f"[{s['timestamp']}] {s['en']}" for s in segments)
@@ -239,11 +292,21 @@ def build_video_message(item: dict) -> str:
     ch_safe = html_escape(ch)
 
     if s.get("no_transcript"):
-        return (
-            f"📺 <b>{ch_safe}</b>\n"
-            f'📰 <a href="{v["url"]}">{title}</a>\n\n'
-            f"⚠️ 無字幕可抓取"
-        )
+        # 沒字幕 → 輕量通知（標題判斷有相關性才會走到這）
+        badge = RELEVANCE_BADGE.get(s.get("relevance", "unknown"), "❔")
+        reason = html_escape(s.get("relevance_reason", ""))
+        tags = "  ".join(f"#{html_escape(t).replace(' ', '_')}" for t in s.get("tags", []))
+        parts = [
+            f"📺 <b>{ch_safe}</b>",
+            f'📰 <a href="{v["url"]}">{title}</a>',
+            "",
+            f"{badge} <i>{reason}</i>",
+        ]
+        if tags:
+            parts.append(tags)
+        parts.append("")
+        parts.append("⚠️ <b>無字幕</b>，無法摘要 / 轉 epub。標題看起來相關，自行決定是否點 YouTube 看。")
+        return "\n".join(parts)
 
     badge = RELEVANCE_BADGE.get(s.get("relevance", "unknown"), "❔")
     relevance_reason = html_escape(s.get("relevance_reason", ""))
@@ -385,6 +448,9 @@ def main():
         new_videos = new_videos[:MAX_VIDEOS_PER_RUN]
 
     summaries = []
+    skipped_no_transcript = 0
+    skipped_off_topic = 0
+
     for i, item in enumerate(new_videos, 1):
         log(f"  [{i}/{len(new_videos)}] {item['channel']}: {item['video']['title'][:60]}")
         try:
@@ -404,19 +470,39 @@ def main():
             "video": item["video"],
             "summary": summary,
         }
+        save_summary(rec)  # 永遠存檔
+
+        # 統一用 relevance 過濾：
+        #   - 有字幕高相關 → 完整摘要 + 轉檔按鈕
+        #   - 沒字幕但標題相關 → 輕量通知（無按鈕）
+        #   - 低相關 / off-topic → 跳過
+        relevance = summary.get("relevance", "unknown")
+        if relevance not in PUSH_RELEVANCE_THRESHOLD:
+            no_t = summary.get("no_transcript", False)
+            log(f"     ⏩ 跳過（{'無字幕+' if no_t else ''}relevance={relevance}）")
+            if no_t:
+                skipped_no_transcript += 1
+            else:
+                skipped_off_topic += 1
+            continue
+
         summaries.append(rec)
-        save_summary(rec)
 
     save_seen(seen)
 
     date = datetime.now().strftime("%Y-%m-%d")
 
-    if skip_email:
+    if skipped_no_transcript or skipped_off_topic:
+        log(f"📊 過濾統計：無字幕 {skipped_no_transcript} 部、低相關 {skipped_off_topic} 部")
+
+    if not summaries:
+        log("📭 沒有符合推送條件的影片（全被過濾），不推送")
+    elif skip_email:
         log(f"⏩ 跳過推送（--no-email）— 摘要已存到 {SUMMARIES_DIR}")
     else:
         asyncio.run(send_to_telegram(summaries, date))
 
-    log(f"✅ 完成 ({len(summaries)} 部摘要)")
+    log(f"✅ 完成（推送 {len(summaries)} / 共 {len(new_videos)} 部新影片）")
 
 
 if __name__ == "__main__":
