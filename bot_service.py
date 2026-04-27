@@ -229,9 +229,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "每天下午 3 點推送 YouTube 訂閱清單摘要。\n\n"
         "<b>即時摘要</b>：直接傳 YouTube 連結（watch / youtu.be / shorts），\n"
         "我會回 150-200 字段落式摘要 + 🎧 轉 epub 按鈕。\n\n"
-        "指令：\n"
+        "<b>指令</b>：\n"
         "  /run — 立刻跑一次 daily_brief\n"
-        "  /list — 列出最近的摘要"
+        "  /list — 列出最近處理過的影片\n\n"
+        "<b>訂閱管理</b>：\n"
+        "  /channels — 看目前訂閱清單\n"
+        "  /sub URL — 新增訂閱（@頻道 或 playlist）\n"
+        "  /unsub 名稱 — 移除訂閱"
     )
 
 
@@ -347,6 +351,119 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+# 訂閱管理指令（/channels / /sub / /unsub）
+# ─────────────────────────────────────────────
+
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出全部訂閱頻道。"""
+    from subscribe import load_channels
+    channels = load_channels()
+    if not channels:
+        await update.message.reply_text("（沒有訂閱）\n用 /sub <URL> 新增")
+        return
+
+    lines = [f"📡 共 <b>{len(channels)}</b> 個訂閱：\n"]
+    for i, ch in enumerate(channels, 1):
+        kind = "頻道" if ch["type"] == "channel" else "Playlist"
+        lines.append(
+            f"{i:2d}. {html_escape(ch['name'])} <i>({kind})</i>\n"
+            f"    <code>{ch['id']}</code>"
+        )
+    lines.append("\n移除：<code>/unsub 名稱</code> 或 <code>/unsub id</code>")
+    await update.message.reply_html("\n".join(lines))
+
+
+async def cmd_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """新增訂閱：/sub <YouTube URL>"""
+    if not context.args:
+        await update.message.reply_text(
+            "用法：/sub <YouTube URL>\n\n"
+            "範例：\n"
+            "  /sub https://youtube.com/@AcquiredFM\n"
+            "  /sub https://youtube.com/playlist?list=PLxxx"
+        )
+        return
+
+    url = context.args[0]
+    await update.message.reply_text(f"⏳ 解析 {url} 中...")
+
+    # 把同步 / 阻塞的 IO 丟到 thread pool，避免卡住 event loop
+    try:
+        from subscribe import (
+            resolve_url, fetch_video_ids,
+            load_channels, save_channels,
+            load_seen, save_seen,
+        )
+
+        kind, cid, fetched_name = await asyncio.to_thread(resolve_url, url)
+        channels = load_channels()
+        if any(c["type"] == kind and c["id"] == cid for c in channels):
+            await update.message.reply_html(
+                f"⚠️ 已訂閱：<b>{html_escape(fetched_name)}</b>"
+            )
+            return
+
+        new_ch = {"type": kind, "id": cid, "name": fetched_name}
+        channels.append(new_ch)
+        save_channels(channels)
+
+        # 把現有影片標記為已看，下次 daily_brief 才不會一次處理 100 部
+        try:
+            ids = await asyncio.to_thread(fetch_video_ids, new_ch)
+            seen = load_seen()
+            seen[f"{kind}:{cid}"] = ids
+            save_seen(seen)
+            seen_count = len(ids)
+        except Exception as e:
+            seen_count = -1
+            logger.warning(f"標記既有影片失敗: {e}")
+
+        msg = (
+            f"✅ 新增訂閱：<b>{html_escape(fetched_name)}</b>\n"
+            f"類型：{'頻道' if kind == 'channel' else 'Playlist'}\n"
+            f"id: <code>{cid}</code>"
+        )
+        if seen_count >= 0:
+            msg += f"\n\n已標記 {seen_count} 部既有影片為已看，之後 daily_brief 只推新片。"
+        await update.message.reply_html(msg)
+
+    except Exception as e:
+        logger.exception(f"/sub 失敗: {e}")
+        await update.message.reply_text(f"❌ 解析失敗：{e}")
+
+
+async def cmd_unsub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """移除訂閱：/unsub <name 或 id>"""
+    if not context.args:
+        await update.message.reply_text(
+            "用法：/unsub <name 或 id>\n\n"
+            "範例：/unsub Acquired\n"
+            "提示：先用 /channels 看有哪些訂閱"
+        )
+        return
+
+    target = " ".join(context.args).strip()
+    from subscribe import load_channels, save_channels, load_seen, save_seen
+
+    channels = load_channels()
+    for i, ch in enumerate(channels):
+        if ch["id"] == target or ch["name"] == target:
+            removed = channels.pop(i)
+            save_channels(channels)
+            seen = load_seen()
+            seen.pop(f"{removed['type']}:{removed['id']}", None)
+            save_seen(seen)
+            await update.message.reply_html(
+                f"✅ 已移除：<b>{html_escape(removed['name'])}</b>"
+            )
+            return
+
+    await update.message.reply_text(
+        f"❌ 找不到：{target}\n用 /channels 看有哪些訂閱"
+    )
+
+
+# ─────────────────────────────────────────────
 # 主程式
 # ─────────────────────────────────────────────
 
@@ -361,6 +478,9 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("channels", cmd_channels))
+    app.add_handler(CommandHandler("sub", cmd_sub))
+    app.add_handler(CommandHandler("unsub", cmd_unsub))
     # 任何含 YouTube URL 的純文字訊息 → 即時摘要
     app.add_handler(
         MessageHandler(

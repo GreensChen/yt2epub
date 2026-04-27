@@ -72,12 +72,14 @@ Acquired 的 Ben & David 訪 Jensen 三小時，從 NVIDIA 早期作為
 ## 功能
 
 - ✅ **YouTube RSS 訂閱**（不用 YouTube API key）
-- ✅ **三層摘要**（relevance + key_points + narrative_blocks 含時間戳金句）
+- ✅ **段落式摘要 + relevance 評分**（high/medium/low/off-topic）
+- ✅ **自動過濾**：沒字幕、低相關性的影片不推
 - ✅ **Gemini / Claude 雙引擎**（環境變數切換）
-- ✅ **Telegram bot 即時互動**（按鈕點選轉檔）
+- ✅ **Telegram 全功能管理**：訂閱清單、即時摘要、轉檔、查紀錄
 - ✅ **直接傳 YouTube URL 給 bot 立刻摘要**
 - ✅ **epub 自動章節分段 + 對談人辨識**
 - ✅ **Pillow 自製文字書封**（無 YouTube 縮圖版權問題）
+- ✅ **YouTube 自動字幕雜訊清理**（`[音樂]` `[笑聲]` `>>` 等）
 - ✅ **Mac / Linux 雙環境**：Mac 上用 Dropbox 桌面版資料夾，伺服器上用 Dropbox API
 
 ## 成本
@@ -123,17 +125,26 @@ cp .env.example .env
 
 ### 3. 設定訂閱清單
 
+三種方式擇一：
+
+**a. 從範例檔開始**
 ```bash
 cp channels.example.json channels.json
 # 編輯 channels.json 加入你想追的頻道
 ```
 
-或用 CLI 工具：
-
+**b. CLI 工具**
 ```bash
 python3 subscribe.py add "https://youtube.com/@AcquiredFM"
 python3 subscribe.py add "https://youtube.com/playlist?list=..."
 python3 subscribe.py list
+```
+
+**c. 部署完成後直接用 Telegram bot**
+```
+/sub https://youtube.com/@AcquiredFM
+/channels
+/unsub Acquired
 ```
 
 ### 4. 第一次跑（標記既有影片為已看，避免一口氣處理 100 部）
@@ -223,6 +234,22 @@ python3 dropbox_auth.py
 ```
 
 跟著腳本指示授權一次，refresh token 會自動寫入 `.env`。
+
+## Telegram bot 指令
+
+部署完成後，跟你的 bot 對話可用：
+
+| 指令 | 說明 |
+|------|------|
+| 直接傳 YouTube URL | 立即生成摘要 + 🎧 轉 epub 按鈕 |
+| `/start` | 顯示說明 |
+| `/run` | 立刻跑一次 daily_brief（不等 15:00）|
+| `/list` | 列出最近處理過的影片 |
+| `/channels` | 列出目前訂閱的頻道 / playlist |
+| `/sub <URL>` | 新增訂閱（@頻道 或 playlist） |
+| `/unsub <名稱或 id>` | 移除訂閱 |
+
+新增訂閱會自動把該頻道**現有的影片標記為已看**，下次 daily_brief 才不會一次處理 100 部歷史影片。
 
 ## Telegram Bot 設定
 
