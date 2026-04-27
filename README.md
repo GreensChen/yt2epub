@@ -27,9 +27,11 @@
 ⭐⭐⭐ Acquired 三巨頭訪 NVIDIA CEO，深度討論 GPU + AI 浪潮
 #NVIDIA #AI #半導體
 
-[Acquired 的 Ben & David 訪 Jensen 三小時，討論 NVIDIA 從遊戲卡公司...]
+Acquired 的 Ben & David 訪 Jensen 三小時，從 NVIDIA 早期作為
+遊戲卡公司、押注 CUDA 被華爾街罵 5 年、AI 浪潮意外讓 NVIDIA
+變 3 兆市值龍頭。Jensen 詳述他的「光速管理」哲學、為什麼公司
+從不做正式預算規劃，以及他對 AI 推論需求即將爆發的判斷。
 
-[ 📝 對談摘要 + 金句 ]
 [ 🎧 轉成 epub → Kobo ]
 ```
 
