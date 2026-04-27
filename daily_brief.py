@@ -57,6 +57,10 @@ MAX_TRANSCRIPT_CHARS = 60000  # 截斷超長字幕（約 ~15k tokens）
 # - off-topic：完全無關（永遠過濾）
 PUSH_RELEVANCE_THRESHOLD = {"high", "medium"}
 
+# 沒字幕的影片直接跳過（無法轉 epub，看摘要意義不大）
+# False 的話會用標題判斷相關性，相關的還是會推輕量通知
+SKIP_NO_TRANSCRIPT = True
+
 SUMMARY_SYSTEM_PROMPT = """你是一位專業的 podcast / 訪談摘要員，服務的對象是一位關注**科技、財經、投資、創業**的讀者。
 
 你的任務是把英文長對談轉成繁體中文摘要，幫他決定**值不值得把整集轉成完整逐字稿 epub**。
@@ -213,7 +217,17 @@ def summarize_video(video: dict, channel_name: str, _client=None) -> dict:
 
     segments, _ = fetch_youtube_transcript(video["url"])
     if not segments:
-        # 無字幕 → 用標題做輕量判斷，讓使用者自己決定要不要看
+        # 無字幕：依 SKIP_NO_TRANSCRIPT 決定要不要還做相關性判斷
+        if SKIP_NO_TRANSCRIPT:
+            print(f"     ⚠️ 無字幕，跳過（不做標題判斷以省 token）")
+            return {
+                "no_transcript": True,
+                "relevance": "skipped",
+                "relevance_reason": "無字幕",
+                "tags": [],
+                "summary": "",
+                "narrative_blocks": [],
+            }
         print(f"     ⚠️ 無字幕，改用標題做相關性判斷")
         title_check = check_title_relevance(video, channel_name)
         return {
@@ -472,10 +486,14 @@ def main():
         }
         save_summary(rec)  # 永遠存檔
 
-        # 統一用 relevance 過濾：
-        #   - 有字幕高相關 → 完整摘要 + 轉檔按鈕
-        #   - 沒字幕但標題相關 → 輕量通知（無按鈕）
-        #   - 低相關 / off-topic → 跳過
+        # 過濾規則：
+        # 1) SKIP_NO_TRANSCRIPT=True 時，沒字幕一律跳過
+        # 2) 否則用 relevance 過濾（low/off-topic 跳過）
+        if SKIP_NO_TRANSCRIPT and summary.get("no_transcript"):
+            log(f"     ⏩ 跳過（無字幕）")
+            skipped_no_transcript += 1
+            continue
+
         relevance = summary.get("relevance", "unknown")
         if relevance not in PUSH_RELEVANCE_THRESHOLD:
             no_t = summary.get("no_transcript", False)
