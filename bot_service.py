@@ -451,6 +451,21 @@ async def cb_menu(query, action: str):
     await query.answer(f"未知選單: {action}")
 
 
+def _extract_brief_summary(output: str) -> str:
+    """從 daily_brief stdout 抓最後一行有意義的結語。"""
+    interesting = ("✅ 完成", "📭 沒有新影片", "找到", "❌")
+    for line in reversed(output.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        # 去掉前面的時間戳 [YYYY-MM-DD HH:MM:SS]
+        if s.startswith("[") and "] " in s:
+            s = s.split("] ", 1)[1]
+        if any(k in s for k in interesting):
+            return s
+    return "（無摘要）"
+
+
 async def _run_daily_brief_bg(chat_id: int, bot):
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -460,9 +475,11 @@ async def _run_daily_brief_bg(chat_id: int, bot):
         stderr=asyncio.subprocess.STDOUT,
     )
     stdout, _ = await proc.communicate()
+    output = stdout.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        tail = stdout.decode("utf-8", errors="replace")[-1000:]
-        await bot.send_message(chat_id, f"❌ daily_brief 失敗:\n{tail}")
+        await bot.send_message(chat_id, f"❌ daily_brief 失敗:\n{output[-1000:]}")
+    else:
+        await bot.send_message(chat_id, f"✅ daily_brief 完成：{_extract_brief_summary(output)}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,9 +600,11 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stderr=asyncio.subprocess.STDOUT,
     )
     stdout, _ = await proc.communicate()
+    output = stdout.decode("utf-8", errors="replace")
     if proc.returncode != 0:
-        tail = stdout.decode("utf-8", errors="replace")[-1000:]
-        await update.message.reply_text(f"❌ daily_brief 失敗:\n{tail}")
+        await update.message.reply_text(f"❌ daily_brief 失敗:\n{output[-1000:]}")
+    else:
+        await update.message.reply_text(f"✅ daily_brief 完成：{_extract_brief_summary(output)}")
 
 
 # ─────────────────────────────────────────────
