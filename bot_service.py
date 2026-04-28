@@ -214,16 +214,11 @@ async def cb_convert(query, video_id: str):
             logger.warning(f"無法更新原訊息按鈕（可能訊息太舊）: {e}")
 
     if proc.returncode == 0:
-        # 從 stdout 抓 epub 路徑
-        epub_path = ""
-        for line in output.splitlines():
-            if "ePub: " in line:
-                epub_path = line.split("ePub: ", 1)[1].strip()
         await safe_edit_markup(InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ 已轉檔到 Kobo", callback_data="noop"),
         ]]))
         await query.message.reply_html(
-            f"✅ <b>{safe_title}</b>\n轉檔完成，已同步到 Dropbox/Kobo。\n<code>{html_escape(epub_path)}</code>"
+            f"✅ <b>{safe_title}</b>\n轉檔完成，已同步到 Dropbox/Kobo。"
         )
     else:
         # 失敗 → 還原按鈕讓使用者重試
