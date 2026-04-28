@@ -16,7 +16,7 @@ from pathlib import Path
 
 # 從 yt2epub 借相同的清理函式
 sys.path.insert(0, str(Path(__file__).parent))
-from yt2epub import clean_caption_noise, OUTPUT_DIR
+from yt2epub import clean_caption_noise, clean_zh_fillers, OUTPUT_DIR
 
 
 # 中文翻譯後也可能殘留的標記
@@ -52,6 +52,8 @@ def scrub_data_file(path: Path) -> int:
             if k in seg:
                 old = seg[k]
                 new = scrub_text(old)
+                if k == "zh":
+                    new = clean_zh_fillers(new)
                 if old != new:
                     seg[k] = new
                     changed += 1

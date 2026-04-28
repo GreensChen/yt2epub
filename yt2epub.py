@@ -60,13 +60,17 @@ GEMINI_THINKING_CHAPTER = 4096    # 分章節：需要推理
 
 TRANSLATION_SYSTEM_PROMPT = """你是一位專業的英翻繁體中文翻譯。請遵守以下規則：
 
-1. 翻譯成自然流暢的繁體中文口語
-2. 重要的英文專業術語、產品名稱、技術概念，在中文後面用括號保留英文原文
+1. 翻譯成自然流暢的繁體中文書面語（適合閱讀，不是逐字逐句的口語稿）
+2. **省略所有語助詞與口吻贅字**，例如：
+   - 英文：uh、um、er、you know、I mean、like（語助詞用法）、actually（贅字）、so（贅字）、well、right
+   - 中文：嗯、痾、啊、喔、那個、你知道、我是說、就是、然後（贅字）
+   翻譯時這些直接拿掉，**不要保留也不要轉寫**。
+3. 重要的英文專業術語、產品名稱、技術概念，在中文後面用括號保留英文原文
    例如：「模型上下文協議（Model Context Protocol）」
-3. 人名保留英文原文
-4. 保持原文的語氣和口吻（正式/輕鬆/幽默）
-5. 不要省略或簡化任何內容，完整翻譯每一句話
-6. 只回傳翻譯結果，不要加任何解釋或前言"""
+4. 人名保留英文原文
+5. 保持原文的語氣（正式/輕鬆/幽默），但要讓文字精煉、像書面文章
+6. 內容意義完整保留（事實、數據、論點），只刪語助詞與重複贅字
+7. 只回傳翻譯結果，不要加任何解釋或前言"""
 
 CHAPTER_SYSTEM_PROMPT = """你是一位 podcast / 訪談內容分析師。請分析以下逐字稿，做兩件事：
 1. 找出對話的所有發言者（主持人、來賓）
@@ -154,6 +158,44 @@ def clean_caption_noise(text: str) -> str:
     text = re.sub(r">>+\s*", " ", text)
     # 收斂多重空白
     text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+# 中文語助詞 / 贅字。LLM 可能還是會留下一些，post-process 再清。
+# 用「孤立詞」匹配：前後是中文標點、句首句尾、空白
+_ZH_FILLER_PATTERN = re.compile(
+    r"(?:^|(?<=[\s，。！？、；：「」『』（）【】「」]))"
+    r"("
+    r"嗯+|嗯嗯+|"          # 嗯、嗯嗯、嗯嗯嗯
+    r"痾+|啊+|喔+|哦+|噢+|呃+|"  # 各種語助詞單字
+    r"那個那個|那個 那個|"   # 重複的「那個」
+    r"就是就是|然後然後|"
+    r"你知道嗎?|我是說|"
+    r"對對對+|是是是+"
+    r")"
+    r"(?=[\s，。！？、；：「」『』（）【】「」]|$)",
+)
+
+# 英文語助詞（在英文原文裡出現的，作為翻譯前清理可選）
+_EN_FILLER_PATTERN = re.compile(
+    r"\b(?:uh+|um+|er+|hmm+|you know|i mean|kind of|sort of)\b[\s,]*",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_zh_fillers(text: str) -> str:
+    """清掉繁中翻譯裡殘留的語助詞 / 重複贅字。"""
+    if not text:
+        return text
+    prev = None
+    # 多跑幾次處理疊加情況（如「嗯，嗯，」）
+    while prev != text:
+        prev = text
+        text = _ZH_FILLER_PATTERN.sub("", text)
+    # 標點疊加修正：「，，」「，。」之類
+    text = re.sub(r"，\s*([，。！？、])", r"\1", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^[，、；。！？\s]+", "", text)  # 開頭多餘標點
     return text.strip()
 
 
@@ -410,7 +452,8 @@ def translate_segments(segments: list[dict], batch_size: int = 10) -> list[dict]
 
         for j, seg in enumerate(batch):
             seg_copy = seg.copy()
-            seg_copy["zh"] = translations.get(j, f"（翻譯失敗：{seg['en'][:50]}...）")
+            zh_text = translations.get(j, f"（翻譯失敗：{seg['en'][:50]}...）")
+            seg_copy["zh"] = clean_zh_fillers(zh_text)
             translated.append(seg_copy)
 
     print(f"✅ 翻譯完成，共 {len(translated)} 段")
