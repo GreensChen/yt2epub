@@ -151,6 +151,23 @@ def fetch_rss(channel: dict) -> list[dict]:
     return videos
 
 
+def is_short(video_id: str) -> bool:
+    """偵測 YouTube Short：請求 /shorts/<id>，若被 redirect 到 /watch 就不是 short。
+
+    無法判定（網路錯誤、HEAD 不支援等）時回傳 False，避免誤過濾正常影片。
+    """
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0"}, method="HEAD"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            final = r.geturl()
+            return "/shorts/" in final
+    except Exception:
+        return False
+
+
 def load_seen() -> dict:
     if not SEEN_FILE.exists():
         return {}
@@ -433,11 +450,19 @@ def main():
             ch_seen = set(seen.get(ch_key, []))
             log(f"  📡 {ch['name']}: RSS 有 {len(videos)} 部，已看 {len(ch_seen)}")
 
+            shorts_skipped = 0
             for v in videos:
-                if v["id"] not in ch_seen:
-                    new_videos.append({"channel": ch["name"], "video": v, "ch_key": ch_key})
-                    ch_seen.add(v["id"])
+                if v["id"] in ch_seen:
+                    continue
+                if is_short(v["id"]):
+                    shorts_skipped += 1
+                    ch_seen.add(v["id"])  # 標記為已看，下次不再檢查
+                    continue
+                new_videos.append({"channel": ch["name"], "video": v, "ch_key": ch_key})
+                ch_seen.add(v["id"])
 
+            if shorts_skipped:
+                log(f"     略過 {shorts_skipped} 部 Shorts")
             seen[ch_key] = list(ch_seen)
         except Exception as e:
             log(f"  ⚠️  {ch['name']} 失敗: {e}")
