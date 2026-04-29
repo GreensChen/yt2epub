@@ -516,7 +516,7 @@ def detect_chapters(segments: list[dict]) -> list[dict]:
 EPUB_CSS = """
 body {
     font-family: "Noto Serif CJK TC", "Source Han Serif TC", "Georgia", serif;
-    /* 不指定 font-size：尊重 Kobo 使用者的字體大小設定（kepub 會吃這個值）*/
+    font-size: 2em;
     line-height: 1.2;
     color: #1a1a1a;
     padding: 1.3em;
@@ -534,7 +534,7 @@ nav ol, nav ul {
 }
 
 h1 {
-    /* 不指定 font-size：讓 Kobo / kepub 用預設 h1 大小（約 2em），章節標題才有層級感 */
+    font-size: 1.6em;  /* Kobo h1 預設約 2em，× 0.8 */
     font-weight: bold;
     color: #222;
     border-bottom: 2px solid #c0392b;
@@ -851,8 +851,10 @@ def build_epub(segments, chapters, meta, output_path):
         <div class="zh">{seg.get('zh', '')}</div>
     </div>"""
 
+        # 第 2 章起強制換頁（inline style 比 class CSS 在 Kobo 上更可靠）
+        break_style = "" if ch_idx == 1 else ' style="page-break-before: always; break-before: page;"'
         chapters_body += f"""
-    <h1 id="ch-{ch_idx}" class="chapter-start">Ch.{ch_idx} — {ch['title_en']}
+    <h1 id="ch-{ch_idx}" class="chapter-start"{break_style}>Ch.{ch_idx} — {ch['title_en']}
         <span class="chapter-zh">{ch['title_zh']}</span>
     </h1>
     {segments_html}"""
