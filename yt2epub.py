@@ -533,6 +533,20 @@ nav ol, nav ul {
     line-height: 1.2;
 }
 
+/* 目錄頁字級（Kobo 會用這個渲染 nav.xhtml，Books 因 linear="no" 跳過）*/
+nav h2 {
+    font-size: 1.1em;
+    margin-bottom: 0.6em;
+}
+nav li {
+    font-size: 0.85em;
+    line-height: 1.6;
+    margin: 0.3em 0;
+}
+nav a {
+    color: #1a1a1a;
+}
+
 h1 {
     font-size: 1.6em;  /* Kobo h1 預設約 2em，× 0.8 */
     font-weight: bold;
