@@ -964,6 +964,8 @@ def convert_to_kepub(epub_path: str) -> str:
 
     final = out_dir / f"{src.stem}.kepub.epub"
     converted.replace(final)
+    # 中間的純 .epub 不需要保留，刪除避免雙檔
+    src.unlink(missing_ok=True)
     print(f"📘 已轉成 kepub: {final.name}")
     return str(final)
 
