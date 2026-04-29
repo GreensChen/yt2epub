@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import uuid
 from datetime import datetime
@@ -910,6 +911,44 @@ def _strip_nav_ordered_list(epub_path: str):
 
 
 # ─────────────────────────────────────────────
+# Step 4.5: 轉成 Kobo 私有的 .kepub.epub 格式
+# ─────────────────────────────────────────────
+
+def convert_to_kepub(epub_path: str) -> str:
+    """用 kepubify 把標準 EPUB 轉成 Kobo 的 .kepub.epub。
+
+    kepub 在每個句子外包 <span class="koboSpan">，這是 Kobo 跨頁畫重點、
+    閱讀統計、書籤精準度等功能仰賴的標記。沒有 kepubify 就回傳原 epub。
+    """
+    kepubify = shutil.which("kepubify")
+    if not kepubify:
+        print("⚠️  找不到 kepubify，跳過轉檔（建議：brew install kepubify）")
+        return epub_path
+
+    src = Path(epub_path)
+    out_dir = src.parent
+    # kepubify 預設輸出 <stem>_converted.kepub.epub；我們用 -o <dir> 由它自己命名
+    proc = subprocess.run(
+        [kepubify, "-o", str(out_dir), str(src)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        print(f"⚠️  kepubify 失敗，改用原 epub: {proc.stderr.strip()[-200:]}")
+        return epub_path
+
+    # 找出 kepubify 產出的檔案，重新命名為更乾淨的 <原檔名>.kepub.epub
+    converted = out_dir / f"{src.stem}_converted.kepub.epub"
+    if not converted.exists():
+        print(f"⚠️  kepubify 沒輸出預期檔案，改用原 epub")
+        return epub_path
+
+    final = out_dir / f"{src.stem}.kepub.epub"
+    converted.replace(final)
+    print(f"📘 已轉成 kepub: {final.name}")
+    return str(final)
+
+
+# ─────────────────────────────────────────────
 # Step 5: Dropbox → Kobo
 # ─────────────────────────────────────────────
 
@@ -1078,14 +1117,17 @@ def main():
     epub_path = str(OUTPUT_DIR / f"{meta.get('safe_filename', 'video')}.epub")
     build_epub(segments, chapters, meta, epub_path)
 
+    # Step 4.5: 轉 Kobo 私有的 kepub 格式（跨頁畫重點等功能仰賴此格式）
+    kobo_path = convert_to_kepub(epub_path)
+
     # Step 5: Kobo
     if not args.no_kobo:
-        copy_to_kobo(epub_path)
+        copy_to_kobo(kobo_path)
 
     print()
     print("=" * 50)
     print("🎉 完成！")
-    print(f"   ePub: {epub_path}")
+    print(f"   ePub: {kobo_path}")
     if not args.no_kobo:
         print("   Kobo: Dropbox 同步後即可下載閱讀")
     print("=" * 50)
