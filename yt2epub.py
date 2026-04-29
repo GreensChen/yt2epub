@@ -516,7 +516,7 @@ def detect_chapters(segments: list[dict]) -> list[dict]:
 EPUB_CSS = """
 body {
     font-family: "Noto Serif CJK TC", "Source Han Serif TC", "Georgia", serif;
-    font-size: 2em;
+    /* 不指定 font-size：尊重 Kobo 使用者的字體大小設定（kepub 會吃這個值）*/
     line-height: 1.2;
     color: #1a1a1a;
     padding: 1.3em;
