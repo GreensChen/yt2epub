@@ -534,7 +534,7 @@ nav ol, nav ul {
 }
 
 h1 {
-    font-size: 1.15em;
+    /* 不指定 font-size：讓 Kobo / kepub 用預設 h1 大小（約 2em），章節標題才有層級感 */
     font-weight: bold;
     color: #222;
     border-bottom: 2px solid #c0392b;
@@ -621,7 +621,7 @@ h1 .chapter-zh {
 }
 
 .episode-info h2 {
-    font-size: 1em;
+    /* 不指定 font-size：讓 Kobo 用預設 h2 大小，副標題才有層級感 */
     font-weight: bold;
     margin-top: 0;
     margin-bottom: 0.5em;
