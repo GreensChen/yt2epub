@@ -1,7 +1,9 @@
 youtube-transcript-api
 anthropic
+google-genai
 ebooklib
 assemblyai
 python-dotenv
 python-telegram-bot
 dropbox
+Pillow
