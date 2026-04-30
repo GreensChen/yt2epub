@@ -277,7 +277,20 @@ def fetch_youtube_transcript(url: str) -> tuple[list[dict], dict]:
     video_id = extract_video_id(url)
     print(f"🎬 正在抓取 YouTube 字幕（Video ID: {video_id}）...")
 
-    ytt_api = YouTubeTranscriptApi()
+    # 雲端 IP 會被 YouTube 擋；偵測 .env 有 Webshare 憑證就走住宅輪替 proxy
+    proxy_user = os.environ.get("WEBSHARE_PROXY_USERNAME")
+    proxy_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+    if proxy_user and proxy_pass:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        ytt_api = YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=proxy_user,
+                proxy_password=proxy_pass,
+            )
+        )
+        print("   🌐 透過 Webshare 住宅 proxy 抓字幕（自動輪替 IP）")
+    else:
+        ytt_api = YouTubeTranscriptApi()
 
     snippets = None
     last_error = None
