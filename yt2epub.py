@@ -712,16 +712,19 @@ def generate_text_cover(title: str, subtitle: str = "") -> bytes:
     draw = ImageDraw.Draw(img)
 
     font_paths = [
-        # macOS
+        # macOS（PingFang 預設是 Regular 粗細）
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
-        # Linux（Ubuntu/Debian 預設裝在這幾個路徑）
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        # Linux：Regular 優先，避免吃到 Bold 讓封面字過粗
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Medium.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        # 最後才 fallback 到 Bold
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
     ]
     title_font = None
     sub_font = None
