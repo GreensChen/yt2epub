@@ -625,6 +625,8 @@ h1 .chapter-zh {
 .speaker-d { color: #8e44ad; border-left-color: #8e44ad; }
 
 .timestamp {
+    /* 視覺上隱藏；保留 koboSpan 結構讓 Cat Wu 等老書重建時 highlight 不破 */
+    display: none;
     font-size: smaller;
     color: #999;
     font-family: monospace;
@@ -775,7 +777,7 @@ def generate_text_cover(title: str, subtitle: str = "") -> bytes:
     return buf.getvalue()
 
 
-def build_epub(segments, chapters, meta, output_path):
+def build_epub(segments, chapters, meta, output_path, render_timestamps: bool = False):
     """組裝雙語 ePub。"""
     print("📖 正在生成 ePub...")
 
@@ -888,6 +890,8 @@ def build_epub(segments, chapters, meta, output_path):
         for seg in ch_segments:
             speaker = seg.get("speaker", "")
 
+            ts_html = f' <span class="timestamp">[{seg["timestamp"]}]</span>' if render_timestamps else ""
+
             if speaker:
                 if speaker in unique_speakers:
                     spk_idx = unique_speakers.index(speaker)
@@ -895,14 +899,16 @@ def build_epub(segments, chapters, meta, output_path):
                     spk_idx = 0
                 spk_class = SPEAKER_CLASSES[spk_idx % len(SPEAKER_CLASSES)]
                 spk_name = speaker_display.get(speaker, speaker)
-                speaker_div = f'<div class="{spk_class}">🎙 {spk_name} <span class="timestamp">[{seg["timestamp"]}]</span></div>'
+                speaker_div = f'<div class="{spk_class}">🎙 {spk_name}{ts_html}</div>'
+            elif render_timestamps:
+                speaker_div = f'<div class="speaker">{ts_html}</div>'
             else:
-                speaker_div = f'<div class="speaker"><span class="timestamp">[{seg["timestamp"]}]</span></div>'
+                speaker_div = ""
 
+            inner = (speaker_div + "\n        " if speaker_div else "") + f'<div class="zh">{seg.get("zh", "")}</div>'
             segments_html += f"""
     <div class="segment">
-        {speaker_div}
-        <div class="zh">{seg.get('zh', '')}</div>
+        {inner}
     </div>"""
 
         # 第 2 章起強制換頁（inline style 比 class CSS 在 Kobo 上更可靠）
@@ -1091,6 +1097,9 @@ def main():
     parser.add_argument("--description", "-d", help="簡介", default="")
     parser.add_argument("--no-kobo", action="store_true", help="不複製到 Kobo")
     parser.add_argument("--from-json", help="從 JSON 重新生成（跳過轉錄和翻譯）")
+    parser.add_argument("--keep-timestamps", action="store_true",
+                        help="保留 timestamp HTML 結構（CSS 仍隱藏）。"
+                             "重建已畫重點的舊書時用，可確保 koboSpan ID 不變。")
     parser.add_argument("--batch-size", type=int, default=10, help="翻譯批次大小")
 
     args = parser.parse_args()
@@ -1173,7 +1182,7 @@ def main():
 
     # Step 4: 生成 ePub
     epub_path = str(OUTPUT_DIR / f"{meta.get('safe_filename', 'video')}.epub")
-    build_epub(segments, chapters, meta, epub_path)
+    build_epub(segments, chapters, meta, epub_path, render_timestamps=args.keep_timestamps)
 
     # Step 4.5: 轉 Kobo 私有的 kepub 格式（跨頁畫重點等功能仰賴此格式）
     kobo_path = convert_to_kepub(epub_path)
