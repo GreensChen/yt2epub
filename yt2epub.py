@@ -260,39 +260,62 @@ def merge_short_segments(
 # ─────────────────────────────────────────────
 
 def fetch_youtube_transcript(url: str) -> tuple[list[dict], dict]:
-    """從 YouTube 抓取英文字幕，回傳 (segments, video_info)。"""
+    """從 YouTube 抓取英文字幕，回傳 (segments, video_info)。
+
+    區分「真的沒字幕」與「暫時被擋」：
+    - NoTranscriptFound / TranscriptsDisabled → 真的沒字幕，直接回 None
+    - 其他錯誤（IP block / 網路 / 解析失敗）→ 重試最多 3 次（指數 backoff）
+    """
+    import time
     from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api._errors import (
+        NoTranscriptFound,
+        TranscriptsDisabled,
+        VideoUnavailable,
+    )
 
     video_id = extract_video_id(url)
     print(f"🎬 正在抓取 YouTube 字幕（Video ID: {video_id}）...")
 
     ytt_api = YouTubeTranscriptApi()
 
-    # 嘗試抓英文字幕（優先手動字幕，其次自動產生）
-    try:
-        transcript_list = ytt_api.list(video_id)
-
-        # 優先找手動英文字幕
-        transcript = None
+    snippets = None
+    last_error = None
+    for attempt in range(1, 4):  # 最多 3 次
         try:
-            transcript = transcript_list.find_manually_created_transcript(['en', 'en-US', 'en-GB'])
-            print("   ✅ 找到手動建立的英文字幕")
-        except Exception:
+            transcript_list = ytt_api.list(video_id)
+            transcript = None
             try:
-                transcript = transcript_list.find_generated_transcript(['en', 'en-US', 'en-GB'])
-                print("   ✅ 找到自動產生的英文字幕")
-            except Exception:
-                print("   ❌ 找不到英文字幕")
-                return None, {}
+                transcript = transcript_list.find_manually_created_transcript(['en', 'en-US', 'en-GB'])
+                print("   ✅ 找到手動建立的英文字幕")
+            except NoTranscriptFound:
+                try:
+                    transcript = transcript_list.find_generated_transcript(['en', 'en-US', 'en-GB'])
+                    print("   ✅ 找到自動產生的英文字幕")
+                except NoTranscriptFound:
+                    print("   ❌ 此影片真的沒有英文字幕")
+                    return None, {}
 
-        fetched = transcript.fetch()
-        snippets = [
-            {"text": s.text, "start": s.start, "duration": s.duration}
-            for s in fetched.snippets
-        ]
+            fetched = transcript.fetch()
+            snippets = [
+                {"text": s.text, "start": s.start, "duration": s.duration}
+                for s in fetched.snippets
+            ]
+            break  # 成功就跳出重試迴圈
 
-    except Exception as e:
-        print(f"   ❌ 無法取得字幕: {e}")
+        except (TranscriptsDisabled, VideoUnavailable) as e:
+            print(f"   ❌ 字幕被關閉或影片不可用: {type(e).__name__}")
+            return None, {}
+
+        except Exception as e:
+            last_error = e
+            wait = 2 ** attempt  # 2s, 4s, 8s
+            print(f"   ⚠️ 第 {attempt} 次嘗試失敗（{type(e).__name__}），{wait}s 後重試")
+            if attempt < 3:
+                time.sleep(wait)
+
+    if snippets is None:
+        print(f"   ❌ 重試 3 次都失敗，最後錯誤: {last_error}")
         return None, {}
 
     # 合併短碎片成可閱讀的段落
