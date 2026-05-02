@@ -29,6 +29,7 @@ rsync -avz --delete \
     --exclude='daily_brief*.log' \
     --exclude='summaries/' \
     --exclude='seen.json' \
+    --exclude='channels.json' \
     --exclude='.claude/' \
     --exclude='.git/' \
     --exclude='server/deploy.sh' \

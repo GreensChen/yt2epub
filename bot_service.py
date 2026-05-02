@@ -170,7 +170,7 @@ async def cb_convert(query, video_id: str):
 
     async with conversion_lock:
         logger.info(f"開始轉檔: {video_id}  {title}")
-        await query.message.reply_html(f"🎬 開始轉檔: <b>{safe_title}</b>\n（通常 1-3 分鐘）")
+        await query.message.reply_html(f"🎬 開始轉檔: <b>{safe_title}</b>")
 
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_BASE_URL"}
         env["PYTHONUNBUFFERED"] = "1"
