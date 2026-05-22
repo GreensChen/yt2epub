@@ -116,7 +116,13 @@ SUMMARY_SYSTEM_PROMPT = """你是一位專業的 podcast / 訪談摘要員，服
 # ─────────────────────────────────────────────
 
 def fetch_rss(channel: dict) -> list[dict]:
-    """從 YouTube RSS 抓取最新影片清單。"""
+    """從 YouTube RSS 抓取最新影片清單。
+
+    走 Webshare 住宅 proxy（如果 .env 有設）— 跟字幕抓取邏輯一致，
+    避免機房 IP 被 YouTube 在每天 15:00 整點 cache refresh 時段 throttle 掉。
+    對 4xx/5xx 多 retry 1 次當保險。
+    """
+    import time as _time
     kind = channel["type"]
     cid = channel["id"]
     if kind == "playlist":
@@ -124,8 +130,36 @@ def fetch_rss(channel: dict) -> list[dict]:
     else:
         url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
 
+    proxy_user = os.environ.get("WEBSHARE_PROXY_USERNAME")
+    proxy_pass = os.environ.get("WEBSHARE_PROXY_PASSWORD")
+    if proxy_user and proxy_pass:
+        proxy_url = f"http://{proxy_user}:{proxy_pass}@p.webshare.io:80"
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+    else:
+        opener = urllib.request.build_opener()
+
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    xml = urllib.request.urlopen(req, timeout=15).read()
+    last_err = None
+    for attempt in range(2):
+        try:
+            xml = opener.open(req, timeout=20).read()
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code in (403, 404, 429, 500, 502, 503, 504) and attempt < 1:
+                _time.sleep(3)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < 1:
+                _time.sleep(3)
+                continue
+            raise
+    else:
+        raise last_err  # unreachable
 
     ns = {
         "atom": "http://www.w3.org/2005/Atom",
